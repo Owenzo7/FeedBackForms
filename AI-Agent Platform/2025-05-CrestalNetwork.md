@@ -86,3 +86,83 @@ Inconsistent whitelist validation across agent creation functions in BlueprintCo
 Make sure that whitelist implementation is in functions that require it.
 
 ## Rewards -> `$77`.
+
+### [M-5]("https://github.com/sherlock-audit/2025-03-crestal-network-judging/issues/65") Malicious actor can re-use signature to undo an update of worker deployment config.
+
+Contract implements two methods of updating deployment config:
+
+updateWorkerDeploymentConfigWithSig() - anyone with valid signature can call it
+updateWorkerDeploymentConfig() only the owner of current worker can call it
+However, the signature from updateWorkerDeploymentConfigWithSig() can be re-used. This leads to the scenario, that everyone can update the worker deployment config to the one from updateWorkerDeploymentConfigWithSig() - which effectively undo any previous updateWorkerDeploymentConfig().
+
+Alice generates signature for Bob
+Bob calls updateWorkerDeploymentConfigWithSig() and updates Alice deployment config
+After some time, Alice calls updateWorkerDeploymentConfig(), to update her config once again
+Malicious actor extracts signature from step 2. and calls updateWorkerDeploymentConfigWithSig() again, which updates the deployment config to the value from the previous call (step 2) and undo the Alice's update (from step 3).
+
+```solidity
+    function getSignerAddress(bytes32 hash, bytes memory signature) public pure returns (address) {
+        address signerAddr = ECDSA.recover(hash, signature);
+        require(signerAddr != address(0), "Invalid signature");
+        return signerAddr;
+    }
+```
+
+```solidity
+    function updateWorkerDeploymentConfigWithSig(
+        address tokenAddress,
+        bytes32 projectId,
+        bytes32 requestID,
+        string memory updatedBase64Config,
+        bytes memory signature
+    ) public {
+        // get EIP712 hash digest
+        bytes32 digest = getRequestDeploymentDigest(projectId, updatedBase64Config, "app.crestal.network");
+
+        // get signer address
+        address signerAddr = getSignerAddress(digest, signature);
+
+        updateWorkerDeploymentConfigCommon(tokenAddress, signerAddr, projectId, requestID, updatedBase64Config);
+    }
+
+```
+
+There's no mechanism protecting from signature re-use. Anyone can call updateWorkerDeploymentConfigWithSig() again, with the same, old signature.
+
+## What went wrong and how to fix it next time.
+
+* Didn't review the whole codebase properly.
+* There was no check for signature replay.
+  
+## Take aways.
+
+* When a function requires you to use a sig always make sure there is no room to replay the function with the very same signature.
+* Put Signature replay checks in a function that requires you to use a sig.
+
+## Rewards -> `$21`
+
+### [H-1]("https://github.com/sherlock-audit/2025-03-crestal-network-judging/issues/16") Unprotected payWithERC20 Function allows complete theft of tokens.
+
+The payWithERC20 function in the Payment contract (inherited by BlueprintCore) lacks proper access controls, allowing any user to call it directly and transfer tokens from any address that has approved the BlueprintCore contract to spend their tokens.
+
+```solidity
+    function payWithERC20(address erc20TokenAddress, uint256 amount, address fromAddress, address toAddress) public {
+        // check from and to address
+        require(fromAddress != toAddress, "Cannot transfer to self address");
+        require(toAddress != address(0), "Invalid to address");
+        require(amount > 0, "Amount must be greater than 0");
+        IERC20 token = IERC20(erc20TokenAddress);
+        token.safeTransferFrom(fromAddress, toAddress, amount);
+    }
+
+```
+
+## What went wrong and how to fix it next time.
+
+* I didn't read the full codebase.
+* Lack of access control in the function.
+* Lack of knowledge on the approve function
+  
+## Take aways.
+
+* Functions with payment capabilities always try to see whether they need access control or not.
