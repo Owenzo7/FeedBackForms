@@ -68,7 +68,7 @@ The lack of access control in the `setWorkerPublicKey` function will cause a sig
 
 ## Take aways.
 
-* Take a keen look at setter functions and see whether they can be exploited. (Make sure to have a full understanding of the codebase to be able to think like this).
+* Take a keen look at setter functions and see whether they can be exploited if it lacks access control. (Make sure to have a full understanding of the codebase to be able to think like this).
   
 
 ## Rewards -> `$897`.
