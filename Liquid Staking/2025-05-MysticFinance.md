@@ -124,3 +124,165 @@ When `withdrawFee()` is later called to transfer accumulated fees to the protoco
 ## Take aways.
 
 During `rebalancing` when ether is being sent to the staking contract make sure that the `withHeldEth` is not part of that amount because they would be problems in the `withdrawFee` function, when trying to withdraw the `withHeldEth` since there is non available.
+
+### [H-5]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/713") Incorrect Withdrawal Amount Accounting in `stPlumeMinter` Contract.
+
+The `withdraw` function in the stPlumeMinter contract contains a critical accounting error that artificially inflates the withdrawn amount when the actual amount withdrawn from Plume staking is less than the requested amount. This can lead to users receiving more ETH than they should, potentially causing a `direct loss of funds for the protocol`.
+
+In the `withdraw` function of the `stPlumeMinter` contract, there is a critical issue with how the withdrawn amount is calculated. When a user requests a withdrawal, after determining the amount to withdraw, there's a check that incorrectly updates the withdrawn amount:
+
+```solidity
+withdrawn = withdrawn>amount ? withdrawn :amount; //fees could be taken by staker contract so that less than requested amount is sent
+```
+This logic means that if the amount withdrawn from Plume staking `(withdrawn)` is less than the requested amount `(amount)`, the code actually sets withdrawn to be equal to the requested amount rather than the actual withdrawn amount. This is fundamentally incorrect accounting.
+
+Later, the protocol fee is calculated based on this potentially inflated amount:
+
+```solidity
+uint256 cachedAmount = withdrawn>amount ? amount :withdrawn;
+amount -= withholdFee;
+withHoldEth += cachedAmount - amount;
+
+```
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+
+## Take aways.
+
+* Always take a keen look at the if and else operators especially in the `withdraw` function.
+* Pay attention to the logic while also doing partial withdrawals to see what breaks.
+
+### [H-6]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/91") DOS in `unstake` and `withdraw` due to zero contract balance in `_rebalance`.
+
+The `_rebalance` function, which is called by `unstake` and `withdraw` operations, passes `address(this).balance` to the `depositEther` function. When all tokens are staked in PlumeStaking and the contract has no balance, these operations will fail until funds are added to the `stPlumeMinter` contract.
+
+```solidity
+function _rebalance() internal {
+  ...
+  
+  depositEther(address(this).balance);  
+}
+
+function depositEther(uint256 _amount) internal returns (uint256 depositedAmount) {
+  // Initial pause check
+  require(!depositEtherPaused, "Depositing ETH is paused");
+
+  require(_amount > 0, "Amount must be greater than 0");
+  ...
+}
+```
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+
+## Take aways.
+
+* During rebalancing always makes sure there is a zero amount check before depositing to the staking contract.
+* Always check the validity of state around other functions that depend on the `rebalance` function.
+
+
+### [H-7]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/89") Claiming causes double counting in `currentWithHeldEth`
+
+The `_claim` function, called by `_rebalance`, invokes `PlumeStaking.claim` to retrieve earned rewards. However, there is an issue with how the stPlumeMinter handles these claimed rewards.
+
+Let's examine how PlumeStaking.claim sends rewards to the `stPlumeMinter`
+
+
+```solidity
+function claim(
+    address token
+) external nonReentrant returns (uint256) {
+    ...
+    calculate totalRewards
+    ...
+
+    if (totalReward > 0) {
+        // Transfer rewards from treasury to user
+        _transferRewardFromTreasury(token, totalReward, msg.sender);
+
+        emit RewardClaimed(msg.sender, token, totalReward);
+    }
+    return totalReward;
+}
+```
+
+Since the tokens are sent from the treasury rather than the `PlumeStaking contract`, they trigger the receive function:
+
+```solidity
+receive() external payable override {
+    if(msg.sender != address(plumeStaking)) {
+        _submit(msg.sender);
+    }
+}
+```
+
+This additional call to `_submit` with the reward amount creates a double-counting issue in `currentWithheldEth`, which breaks withdrawal functionality by any user that wants to withdraw maximum of `currentWithheldEth`.
+
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+
+## Take aways.
+
+Always look at the `claim` function and follow what it does to the other contract in terms of storage updates.
+
+
+### [H-8]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/87") The `currentWithheldETH` incorrectly updates when unstake.
+
+The `currentWithheldETH` incorrect updates when `unstaking` leading to incorrect withdrawn flow and funds might be stuck in `PlumeStaking`. Let’s take a look at the code and notes:
+
+```solidity
+ function unstake(uint256 amount) external nonReentrant returns (uint256 amountUnstaked) {
+  ...
+  // Check if we can cover this with withheld ETH
+  if (currentWithheldETH >= amount) {
+      amountUnstaked = amount;
+      cooldownTimestamp = block.timestamp + 1 days;
+  }else{
+      uint256 remainingToUnstake = amount;
+      amountUnstaked = 0;
+      if (currentWithheldETH > 0) {
+          amountUnstaked = currentWithheldETH;
+          remainingToUnstake -= currentWithheldETH;
+          currentWithheldETH = 0; 
+      }
+      ...
+    }
+    ...
+  }
+
+```
+
+During the `withdraw` function, the `currentWithheldETH` is checked again in:
+
+```solidity
+function withdraw(address recipient) external nonReentrant returns (uint256 amount) {
+	...
+  if(amount > currentWithheldETH ){
+      withdrawn = plumeStaking.withdraw();
+      currentWithheldETH = 0;
+  } else {
+      withdrawn = amount;
+      currentWithheldETH -= amount;
+  }
+
+```
+
+When there is a two withdrawals less than `currentWithheldETH` , one of the withdrawals might get stuck until more deposits and withdrawals fix the `currentWithheldEth` accounting.
+
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+
+## Take aways.
+
+Pay attention to the `unstake ` function and make sure that the currentWithheldETH never gets set to zero.
