@@ -286,3 +286,104 @@ When there is a two withdrawals less than `currentWithheldETH` , one of the with
 ## Take aways.
 
 Pay attention to the `unstake ` function and make sure that the currentWithheldETH never gets set to zero.
+
+
+### [M-1]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/737") Protocol doesnt take into account max validator percentage.
+
+The function `getNextValidator` selects the validator in which the stake will be made.
+
+```solidity
+    function getNextValidator(uint depositAmount) public returns (uint256 validatorId, uint256 capacity) {
+        // Make sure there are free validators available
+        uint numVals = numValidators();
+        require(numVals != 0, "Validator stack is empty");
+
+        for (uint256 i = 0; i < numVals; i++) {
+            validatorId = validators[i].validatorId;
+            if(validatorId == 0) break;
+            (bool active, , , ) = plumeStaking.getValidatorStats(uint16(validatorId));
+
+            if (!active) continue;
+            (PlumeStakingStorage.ValidatorInfo memory info,uint256 totalStaked , ) = plumeStaking.getValidatorInfo(uint16(validatorId));
+                
+            if (info.maxCapacity != 0 || totalStaked < info.maxCapacity) {
+                return (validatorId, info.maxCapacity - totalStaked);
+            }
+
+            if(info.maxCapacity == 0){
+                return (validatorId, type(uint256).max-1);
+            }
+        }
+
+```
+
+In order that the `validator` can actually be validated the protocol checks that exactly the amount will be entered into the `validator` so that the max capacity of the validator is not exceeded.
+
+However, the protocol does not take into account that the amount of the steak also depends on whether the validator amount will `exceed` the maximum percentage.
+
+Here is the check from `stake function of Plume staking`:
+
+```solidity
+  // Check if exceeding validator percentage limit
+        if ($.totalStaked > 0 && $.maxValidatorPercentage > 0) {
+            uint256 validatorPercentage = (newDelegatedAmount * 10_000) / $.totalStaked;
+            if (validatorPercentage > $.maxValidatorPercentage) {
+                revert ValidatorPercentageExceeded();
+            }
+        }
+```
+
+So, we realize that the validator returned by the `getNextValidator` function is not really suitable for steaking with this amount.
+
+It is necessary to check this when choosing a validator, otherwise deposits may reverts just because of one validator and because the protocol keeps trying to deposit into it, although it simply cannot accept more plume, because its percentage is already higher than the `maximum`.
+
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+## Take aways.
+
+* Need to do my due dilligence and always compare some piece of code to the live codebase.
+
+
+### [M-2]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/726") getNextValidator() Uses totalStaked Instead of delegatedAmount, Breaking Capacity Logic.
+
+`getNextValidator()` calculates a validator’s available capacity using `info.maxCapacity - totalStaked`, but the `PlumeStaking.stake()` function enforces capacity limits using `validator.delegatedAmount`. This discrepancy leads to a situation where a `validator` is selected by `getNextValidator()` despite having `insufficient` available capacity, resulting in a revert when `stake()` is eventually called.
+
+
+The following code in getNextValidator() calculates available capacity `(if maxCapacity > 0)`:
+
+```solidity
+            if (info.maxCapacity != 0 || totalStaked < info.maxCapacity) {
+                return (validatorId, info.maxCapacity - totalStaked);
+            }
+
+```
+
+However, the PlumeStaking contract enforces the capacity check as:
+
+
+```solidity
+@>      $.validators[validatorId].delegatedAmount += stakeAmount;
+        $.validatorTotalStaked[validatorId] += stakeAmount;
+        $.totalStaked += stakeAmount;
+
+        // Check if exceeding validator capacity
+@>      uint256 newDelegatedAmount = $.validators[validatorId].delegatedAmount;
+        uint256 maxCapacity = $.validators[validatorId].maxCapacity;
+@>      if (maxCapacity > 0 && newDelegatedAmount > maxCapacity) {
+@>          revert ExceedsValidatorCapacity(validatorId, newDelegatedAmount, maxCapacity, stakeAmount);
+        }
+```
+
+This mismatch results in incorrect validator selection: a validator may appear to have capacity based on totalStaked, but the actual enforced value `delegatedAmount` exceeds the `maxCapacity`, causing reverts.
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+## Take aways.
+
+* Need to do my due dilligence and always compare some piece of code to the live codebase.
+* Always make sure the right metrics are used when checking the validator has exceeded the `maxCapacity`.
