@@ -510,3 +510,48 @@ Let's imagine the situation. A user has requested to withdraw 100 tokens.
 ## Take aways.
 
 * Always make sure that `totalWithdrawable >= amount` in the withdraw function (In other terms make sure that `totalWithdrawable >= requested amount`).
+
+
+### [M-5]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/444") Validator Slashing Events in plumeStaking Lead to Uneven Loss Distribution.
+
+
+When a `validator` is slashed in the `plumeStaking` contract, it is marked as `inactive`. The `stPlumeMinter::unstake()` function only iterates over active validators to call plumeStaking.unstake(). As a result, slashed validators are excluded from the withdrawal process. This creates an imbalance: users who withdraw early can fully recover their stake, while those who withdraw later will receive nothing and absorb the entire loss from slashing.
+
+The `slashValidator()` method can be reviewed here: https://explorer.plume.org/address/0xb4791ac282E9eA7b9f76444D9b5B34c7892f07Df?tab=contract
+
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+## Take aways.
+
+* Always make sure that there is a `slashing mechanism` within the protocol to avoid loss on users.
+
+
+### [M-6]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/454") Lack of Validator Status Check in `restake()`
+
+Currently, the `restake()` function does not perform any access control or status validation for the target `validatorId`. Suppose the protocol later adds admin-only access to restake() and the admin verifies that the provided validator is valid and active at the time of the call. However, if the validator gets slashed and becomes inactive just before the admin executes `stPlumeMinter::restake()`, the function will still proceed. In this case, funds will be restaked to an inactive validator.
+
+Since the protocol's `unstake()` logic ignores inactive validators, any funds restaked to them become effectively locked and cannot be withdrawn.
+
+```solidity
+    function restake(uint16 validatorId) external nonReentrant returns (uint256 amountRestaked) {
+        _rebalance();
+        (PlumeStakingStorage.StakeInfo memory info) = plumeStaking.stakeInfo(address(this));
+
+@>        amountRestaked = plumeStaking.restake(validatorId, info.cooled + info.parked);
+        
+        emit Restaked(address(this), validatorId, amountRestaked);
+        return amountRestaked;
+    }
+
+```
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+## Take aways.
+
+* Always make sure that there is a validator status check within `restake` function.
