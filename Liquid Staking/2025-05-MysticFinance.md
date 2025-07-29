@@ -555,3 +555,218 @@ Since the protocol's `unstake()` logic ignores inactive validators, any funds re
 ## Take aways.
 
 * Always make sure that there is a validator status check within `restake` function.
+
+
+### [M-7]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/304") `getValidatorStats` prevent us from unstaking from any validator besides the first one.
+
+Users will be unable to unstake from the second and any validator after it. Unstake only works for the first one. Any funds staked to any other validator will be impossible to be unstaked.
+
+When unstaking we get `plumeStaking.getValidatorStats` and check if his stakedAmount is positive or not, and if positive we continue and call unstake on that validator:
+
+```solidity
+
+            while (remainingToUnstake > 0 && validatorId <= numVals) {
+                //@finding H this gets totalStaked for the validator, not how much we have staked
+                (bool active,, uint256 stakedAmount,) = plumeStaking.getValidatorStats(uint16(validatorId));
+
+                if (active && stakedAmount > 0) {
+                    // Calculate how much to unstake from this validator
+                    uint256 unstakeFromValidator = remainingToUnstake > stakedAmount ? stakedAmount : remainingToUnstake;
+
+                    uint256 actualUnstaked = plumeStaking.unstake(validatorId, unstakeFromValidator);
+                    amountUnstaked += actualUnstaked;
+                    remainingToUnstake -= actualUnstaked;
+                    if (remainingToUnstake == 0) break;
+                }
+
+                validatorId++;
+                require(validatorId <= 10, "Too many validators checked");
+            }
+
+```
+
+However getValidatorStats returns the totalStaked for that validator, not how much we have staked for him:
+
+https://explorer.plume.org/address/0xA20bfe49969D4a0E9abfdb6a46FeD777304ba07f?tab=contract
+
+```solidity
+    function getValidatorStats(
+        uint16 validatorId
+    ) external view returns (bool active, uint256 commission, uint256 totalStaked, uint256 stakersCount) {
+        PlumeStakingStorage.Layout storage $ = _getPlumeStorage();
+
+        if (!$.validatorExists[validatorId]) {
+            revert ValidatorDoesNotExist(validatorId);
+        }
+
+        PlumeStakingStorage.ValidatorInfo storage validator = $.validators[validatorId];
+        active = validator.active;
+        commission = validator.commission;
+        totalStaked = $.validatorTotalStaked[validatorId];
+        stakersCount = $.validatorStakers[validatorId].length;
+        return (active, commission, totalStaked, stakersCount);
+    }
+
+```
+
+This means that if any other user stakes directly for that validator (which there already are) our contracts will always have a positive `stakedAmount` and call `unstake`, even if our stake for this validator is.
+
+When we call `unstake` for a validator which we have 0 staked amount the TX will revert as `info.staked == 0`:
+
+https://explorer.plume.org/address/0xA20bfe49969D4a0E9abfdb6a46FeD777304ba07f?tab=contract
+
+```solidity
+
+    function _unstake(uint16 validatorId, uint256 amount) internal returns (uint256 amountUnstaked) {
+        PlumeStakingStorage.Layout storage $ = _getPlumeStorage();
+
+        // Verify validator exists
+        if (!$.validatorExists[validatorId]) {
+            revert ValidatorDoesNotExist(validatorId);
+        }
+
+        PlumeStakingStorage.StakeInfo storage info = $.userValidatorStakes[msg.sender][validatorId];
+        PlumeStakingStorage.StakeInfo storage globalInfo = $.stakeInfo[msg.sender];
+
+        if (info.staked == 0) {
+            revert NoActiveStake();
+        }
+
+```
+
+
+Example:
+
+1. Alice stakes for the first validator 100
+2. A lot of users use stPlumeMinter and they stake a total of 2k tokens
+3. The first validator has only 500 max capacity, so these 1600 tokens leftover are staked for validator2
+4. After some time users start unstaking faster than new users are staking
+5. This will drain the first validator stake of 400 (as 100 is Alice's stake)
+6. After that all unstake TX will start reverting as we are trying to unstake for a validator we have 0 staked.
+   
+Validator2 has 1600 tokens in him, but we are unable to unstake them unstake sees that the first validator has 100 tokens inside (Alice tokens) and tries to call unstake on it:
+
+```solidity
+                (bool active,, uint256 stakedAmount,) = plumeStaking.getValidatorStats(uint16(validatorId));
+
+                if (active && stakedAmount > 0) {
+                    // Calculate how much to unstake from this validator
+                    uint256 unstakeFromValidator = remainingToUnstake > stakedAmount ? stakedAmount : remainingToUnstake;
+
+                    uint256 actualUnstaked = plumeStaking.unstake(validatorId, unstakeFromValidator);
+
+```
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+## Take aways.
+
+* Always make sure that the right variable is used during `unstaking` of a function.
+
+
+### [M-8]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/264") Improper validator ID iteration may cause revert.
+
+The `stPlumeMinter::unstake` function assumes validator IDs are sequential and start at 1 up to numValidators(), which may not match actual validator IDs. This can cause invalid validator lookups and transaction reverts.
+
+```solidity
+uint256 numVals = numValidators();
+            // if we have 10 validators this index will be up to 10 and thus get out of bounds as length will be 10, but the last will be at getValidatorStats(9)?
+```
+
+In the `unstake` function of the `stPlumeMinter` contract, the logic iterates over validator IDs starting from `1` up to `numValidators()`, assuming that validator IDs are both sequential and contiguous. However, this assumption is incorrect, as validator IDs in the `PlumeStaking` contract are not guaranteed to be assigned in order or without gaps.
+
+The function calls `plumeStaking.getValidatorStats(uint16(validatorId))` during iteration. If `validatorId` points to an ID that does not exist in the underlying storage (i.e., $.validatorExists[validatorId] is false), the call reverts due to the check in `getValidatorStats`, triggering the `ValidatorDoesNotExist` error.
+
+ https://explorer.plume.org/address/0xA20bfe49969D4a0E9abfdb6a46FeD777304ba07f?tab=contract
+
+ ```solidity
+function getValidatorStats(
+        uint16 validatorId
+    ) external view returns (bool active, uint256 commission, uint256 totalStaked, uint256 stakersCount) {
+        PlumeStakingStorage.Layout storage $ = _getPlumeStorage();
+        if (!$.validatorExists[validatorId]) {
+            revert ValidatorDoesNotExist(validatorId);
+        }
+
+ ```
+
+The core issue is that the loop assumes the highest validator ID is equal to `numValidators()`, which is merely the number of validators stored—not necessarily the maximum validator ID assigned => The last validator ID accessed in the loop may be invalid because it could refer to an ID that was never registered. This leads to a revert when `getValidatorStats` is called on a non-existent ID, as the underlying `PlumeStaking` contract explicitly reverts if `validatorExists[validatorId]` is false. 
+
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+* Didn't pay attention to the loop
+
+## Take aways.
+
+* Make sure the loop correctly iterates to avoid out of bounds error.
+  
+
+### [M-9]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/252") Removing/swapping a validator will always affect users that staked with them.
+
+Removing or modifying a validator unintentionally impacts users who have staked through that validator, as their staked tokens and rewards become untracked or inaccessible.
+
+The Protocol currently allows the contract owner/operators to remove and swap validators using the `removeValidator()` and `swapValidator()` function without migrating or preserving existing user stakes or reward entitlements. Which makes removing and swapping validator difficult with out harming it users. The root cause of this is because both of the functions lack checks to see if validators have active users staked with them and the protocol lack features(functions) that help to migrate users staked funds and rewards to the newly swapped validator.
+
+Seeing as in the protocol Storage contract: `PlumeStakingStorage` extensively utilizes mapping of users, tokens and validators, swapping or removing a validator will always cause harm; causing operations that utilize these mappings to fail due to the modifications.
+
+here are the respective function codes Below;
+
+```solidity
+    function removeValidator(uint256 remove_idx, bool dont_care_about_ordering) public onlyByOwnGov {
+        // Get the pubkey for the validator to remove (for informational purposes)
+        uint256 removed_validatorId = validators[remove_idx].validatorId;
+
+        // Less gassy to swap and pop
+        if (dont_care_about_ordering){
+            // Swap the (validator to remove) with the (last validator in the array)
+            swapValidator(remove_idx, validators.length - 1);
+
+            // Pop off the validator to remove, which is now at the end of the array
+            validators.pop();
+        }
+        // More gassy, loop
+        else {
+            // Save the original validators
+            Validator[] memory original_validators = validators;
+
+            // Clear the original validators list
+            delete validators;
+
+            // Fill the new validators array with all except the value to remove
+            for (uint256 i = 0; i < original_validators.length; ++i) {
+                if (i != remove_idx) {
+                    validators.push(original_validators[i]);
+                }
+            }
+        }
+
+        emit ValidatorRemoved(removed_validatorId, remove_idx, dont_care_about_ordering);
+    }
+    function swapValidator(uint256 from_idx, uint256 to_idx) public onlyByOwnGov {
+        // Get the original values
+        Validator memory fromVal = validators[from_idx];
+        Validator memory toVal = validators[to_idx];
+
+        // Set the swapped values
+        validators[to_idx] = fromVal;
+        validators[from_idx] = toVal;
+
+        emit ValidatorsSwapped(fromVal.validatorId, toVal.validatorId, from_idx, to_idx);
+    }
+
+```
+
+**Note: Even as validators with user staked with them are swapped for another validator(with the same poistion). User the staked token and rewards earned from the previous validators will forever be lost. As there rewards and staked funds are not automatically migrated to the new validator.**
+
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+  
+## Take aways.
+
+* Always make sure when a validator is being removed/swapped there is functionality to migrate user's stakes to the next active validator.
