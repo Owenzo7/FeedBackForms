@@ -387,3 +387,126 @@ This mismatch results in incorrect validator selection: a validator may appear t
 
 * Need to do my due dilligence and always compare some piece of code to the live codebase.
 * Always make sure the right metrics are used when checking the validator has exceeded the `maxCapacity`.
+
+
+### [M-3]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/633") Incorrect type assignment from array return value allows inaccurate ETH accounting and incorrect event emission.
+
+An ABI mismatch allows a call to succeed silently while returning incorrect data, causing incorrect accounting of claimed rewards.
+
+The contract `StPlumeMinter` interacts with `PlumeStaking` via the function:
+
+```solidity
+function claimAll() external returns (uint256 totalAmount);
+```
+
+However, the actual implementation of `claimAll(`) in PlumeStaking returns a `uint256[] memory`, not a single `uint256`.
+
+
+```solidity
+
+  function claimAll() external nonReentrant returns (uint256[] memory) {
+        PlumeStakingStorage.Layout storage $ = plumeStorage();
+        address[] memory tokens = $.rewardTokens;
+        uint256[] memory claims = new uint256[](tokens.length);
+       .......
+
+```
+
+The call does not revert ,this boils down to how Solidity (and the EVM) decode return values:
+
+`uint256[]` is ABI encoded as:
+
+```bash
+0x20                              → offset to data (32 bytes)
+0x01                              → array length (1)
+0x0000000000000000000000000000000000000000000000000000000000000123 → element 0
+
+```
+
+the contract is expecting a `uint256`, so the decoder grabs the first 32 bytes the offset value `(0x20)` — and treats that as the result. That means the amounts becomes `32` regardless of the actual reward.
+
+This leads to `currentWithheldETH` being incremented incorrectly and also the function does not set the `totalAmount` variable.
+
+
+```solidity
+ function claimAll() external nonReentrant onlyRole(CLAIMER_ROLE) returns (uint256 totalAmount) {
+        uint256 amounts = plumeStaking.claimAll();
+        currentWithheldETH += amounts;
+
+        emit AllRewardsClaimed(address(this), totalAmount);
+        return totalAmount;
+    }
+
+```
+
+emits misleading events such as `AllRewardsClaimed(..., 0)` despite rewards being transferred internally.
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+## Take aways.
+
+* Need to do my due dilligence and always compare some piece of code to the Interface to see whether the return format is correct especially in the `claim` function.
+
+
+### [M-4]("https://cantina.xyz/code/c160af78-28f8-47f7-9926-889b3864c6d8/findings/556") Withdraw function doesn’t check that `total withdrawable` is more than requested amount so protocol fees can be withdrawn.
+
+Let's take a look at the `withdraw` function. Let's say a user requested a withdrawal. But during the period of waiting for withdraw `totalWithdrawable = plumeStaking.amountWithdrawable() + currentWithheldETH` may have become less than the required amount for withdrawal, since the currentWithheldETH, parked, cooled funds may have been reduced by the withdrawal of other users.
+
+However, the function nowhere checks that totalWithdrawable is greater than amount.
+
+The only place where it can give a revert is:
+
+```solidity
+address(recipient).call{value: amount}();
+```
+
+if there is not enough money in the contract, such a call simply will not go through. However, do not forget that the contract also contains commission funds, which are not taken into account neither in currentWithheldETH nor in `plumeStaking.amountWithdrawable()` - and such output can pass only at the expense of commission funds.
+
+```solidity
+    /// @notice Withdraw available funds that have completed cooling
+    function withdraw(address recipient) external nonReentrant returns (uint256 amount) {
+        _rebalance();
+        WithdrawalRequest storage request = withdrawalRequests[msg.sender];
+        uint256 totalWithdrawable = plumeStaking.amountWithdrawable() + currentWithheldETH;
+        require(block.timestamp >= request.timestamp, "Cooldown not complete");
+        require(totalWithdrawable > 0, "Withdrawal not available yet");
+
+        amount = request.amount;
+        uint256 withdrawn;
+        request.amount = 0;
+        request.timestamp = 0;
+
+        if(amount > currentWithheldETH ){
+            withdrawn = plumeStaking.withdraw();
+            currentWithheldETH = 0;
+        } else {
+            withdrawn = amount;
+            currentWithheldETH -= amount;
+        }
+
+        withdrawn = withdrawn>amount ? withdrawn :amount; //fees could be taken by staker contract so that less than requested amount is sent
+        uint256 withholdFee = amount * WITHHOLD_FEE / 10000;
+        currentWithheldETH += withdrawn - amount ; //keep the rest of the funds for the rest of users that might have unstaked to avoid gas loss to unstake, withdraw but fees are taken by staker too so recognize that
+        uint256 cachedAmount = withdrawn>amount ? amount :withdrawn;
+        amount -= withholdFee;
+        withHoldEth += cachedAmount - amount;
+
+        address(recipient).call{value: amount}(""); //send amount to user
+        emit Withdrawn(msg.sender, amount);
+        return amount;
+    }
+```
+
+Let's imagine the situation. A user has requested to withdraw 100 tokens.
+
+`currentWithheldETH = 20`, `amountWithdrawable = 70`, and also `withHoldEth = 20`. This call will pass, although withHoldEth is a fees of the protocol which could be withdrawn in this function.
+
+## What went wrong and how to fix it next time.
+
+* Didn't really think about this.
+
+## Take aways.
+
+* Always make sure that `totalWithdrawable >= amount` in the withdraw function (In other terms make sure that `totalWithdrawable >= requested amount`).
