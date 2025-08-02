@@ -484,8 +484,8 @@ The issue is that the collateral on the shares registry does not register the yi
 
 So if the holding has, for example:
 
-  * Deposited 100e18 to strategy 1, which increased to 110e18
-  * Deposited 5e18 to strategy 2, which increased to 10e18
+  * Deposited 100e18 to strategy 1, which increased to 110e18.
+  * Deposited 5e18 to strategy 2, which increased to 10e18.
 The function will attempt to retrieve a total of 105e18, which is the deposited collateral. After the first loop, the holding balance will be 110e18, which satisfies condition @1 above.
 
 The loop will break and will not retrieve the collateral from strategy 2. The admin will lose 10e18, which is the current value deposited to strategy 2.
@@ -538,3 +538,132 @@ So if a user wants to mint jUSD based on USD `1,000` worth of collateral, jUsdMi
 ## Take aways.
 
 * If the stablecoin to mint depends on querying an oracle price then its obvious for depegging to happen. (meaning that minting can happen for less than `1USD`)
+
+### [M-1]("https://cantina.xyz/code/7a40c849-0b35-4128-b084-d9a83fd533ea/findings/586") Malicious User Can Game Protocol Liquidation via Direct Deposit.
+
+Direct collateral transfers to user holdings aren’t tracked, enabling users to leverage unaccounted collateral in strategies. This can result in bad debt after strategy losses, causing the protocol owner to absorb losses and allowing potential protocol manipulation.
+
+Users can transfer collateral tokens directly to their holding addresses without this being tracked in the protocol’s collateral accounting. The protocol only updates collateral balances on explicit deposit calls, so these direct transfers remain untracked but can still be invested in strategies.
+
+When a user invests this untracked collateral, any strategy losses reduce the actual collateral value. However, since the protocol’s accounting doesn’t reflect the extra collateral, even a small strategy loss can immediately push the user’s position into bad debt.
+
+As a result, the protocol owner is forced to liquidate the user’s position, effectively covering the outstanding debt. This creates an exploitable scenario where users can game the system by leveraging untracked collateral: if the strategy wins, the user profits normally; if it loses, the user’s loss is minimized because they keep previously minted jUsd while the owner absorbs the bad debt.
+
+Note: Untracked collateral is never sent to the owner during liquidation. Additionally, this untracked collateral is withdrawable by the user using `HoldingManager.sol#withdraw()`.
+
+
+## What went wrong and how to fix it next time.
+
+* Didn't review the codebase like this.
+* Dint't think about this attack vector.
+
+## Take aways.
+
+* Check to see if a user can game the protocol through direct donation to his or her balance if its not tracked by the protocol during liquidation.
+* When liquidating positions that have invested in strategies and it tanks below the value of the debt, make sure the `tracked + untracked` collateral value is accounted for to the liquidator during the liquidation stage.
+
+### [M-2]("https://cantina.xyz/code/7a40c849-0b35-4128-b084-d9a83fd533ea/findings/1436") Collateral can not be properly retired by making its sharesRegistry inactive
+
+The protocol has a feature for making a whitelisted collateral's registry inactive when they plan to end support for it. This is part of the protocol lifecycle.
+
+Intended sequence :
+
+* Collateral is whitelisted and its sharesRegistry is added to StablesManager contract.
+* Right now the registry is set to active in StablesManager, with the ability to set it to inactive by the protocol admins when they want to retire the collateral product/ end support for it in Jigsaw.
+* The reason for sunsetting a collateral could be anything : protocol economic risks, business decision and partnerships, collateral becomes malicious or hacked
+* A major risk would be the depegging of other stablecoins supported as collateral in Jigsaw
+This is reasonable given that some collateral tokens supported in Jigsaw have deppeged in the recent past (USD0PP and USDC
+
+* But the problem is that the collateral retirement will not be possible because of the way isRegistryActive checks are applied across the whole codebase.
+
+For example :
+
+* `liquidateBadDebt()` and `liquidate()` => `forceRemoveCollateral()` reverts if registry is inactive so it will block bad debt liquidations
+* `StrategyManager.claimInvestment()` => `forceRemoveCollateral()/ addCollateral()` it checks that collateral registry is active so withdrawals from strategy will again be impossible.
+* `repay() => check isRegistryActive`
+* `withdraw() => removeCollateral()` checks the registry should be active.
+  
+All these methods to `exit/ withdraw funds` from the protocol should still be accessible after the collateral is retired, so that pending bad debt positions can be closed and honest depositors can acquire their collateral. If the registry is ever set to inactive, then it will lock all user funds as well as repayment mechanisms, making `JUSD` worthless because of the potential bad debt.
+
+Note that this collateral retirement can also not be done via other controls like `iswhitelisted`, sharesRegistry set to zero or other checks because every check blocks some of these operations. Not even pausing the contracts will help because it will pause everything.
+
+Hence, there is no way to disable borrowing on a specific collateral if it gets depegged or hacked or anything because if the sharesRegistry is disabled it will also disable liquidations and repayments etc.
+
+## What went wrong and how to fix it next time.
+
+* Didn't review the codebase like this.
+* Dint't think about this attack vector.
+  
+## Take aways.
+
+* Make sure when a collateral token is blacklisted, inactive or even disabled it should be such that it only `blocks new deposits/ borrows and strategy investments` etc. but does not block `exits withdrawals/ repayments and liquidations` of the existing positions in the system.
+
+
+### [M-3]("https://cantina.xyz/code/7a40c849-0b35-4128-b084-d9a83fd533ea/findings/1374") Withdrawals of rewards earned through strategies should not be charged with withdrawal fees.
+
+f we check the StrategyManager.sol logic, we can see that any claimRewards() call by holding user will lead to strategy.claimRewards(). For example, Aave deposits give extra reward tokens, so the strategy helps us withdraw these from the Aave rewardController.
+
+Here is the code from AaveV3StrategyV2.sol :
+
+```solidity
+    function claimRewards(
+        address _recipient,
+        bytes calldata
+    ) external override nonReentrant onlyStrategyManager returns (uint256[] memory, address[] memory) {
+        // aTokens should be checked for rewards eligibility.
+        address[] memory eligibleTokens = new address[](1);
+        eligibleTokens[0] = tokenOut;
+
+        // Make the claimAllRewards through the user's Holding.
+        (, bytes memory returnData) = _genericCall({
+            _holding: _recipient,
+            _contract: address(rewardsController),
+            _call: abi.encodeCall(IRewardsController.claimAllRewards, (eligibleTokens, _recipient))
+        });
+```
+
+This will ultimately lead to the reward tokens being forwarded to the holding address.
+
+Now this `claimRewards()` logic also charges a performance fee on the rewards, because these are earned via jigsaw.
+
+```solidity
+
+        (uint256 performanceFee,,) = _getStrategyManager().strategyInfo(address(this));
+        address feeAddr = manager.feeAddress();
+
+        // Take performance fee for all the rewards.
+        for (uint256 i = 0; i < rewardsList.length; i++) {
+            uint256 fee = OperationsLib.getFeeAbsolute(claimedAmounts[i], performanceFee);
+            if (fee > 0) {
+                claimedAmounts[i] -= fee;
+                emit FeeTaken(rewardsList[i], feeAddr, fee);
+                IHolding(_recipient).transfer({ _token: rewardsList[i], _to: feeAddr, _amount: fee });
+            }
+        }
+
+```
+
+These performance fees are directly taken from the holding. The `MAX_PERFORMANCE_FEE` as per the manager contract is upto 25 %.
+
+So upto `25 %` of fees has been already deducted form the rewards earned.
+
+Then how will the holding owner claim these rewards out of the system for his own external use ? He will have to use the `withdraw()` function in `HoldingManager`.
+
+The problem is that the `withdraw()` function again charges a withdrawal fee on these rewards as well.
+
+The `MAX_WITHDRAWAL_FEE` as per manager contract is `8 %`, meaning the rewards earned would be reduced again by upto `8 %`.
+
+This is unnecessary because the withdrawal fee is supposed to be for users exiting the system by taking out the collateral, while the rewards earned should be solely belonging to the holding owner, as the protocol has already taken upto a massive `25 %` cut.
+
+This will lead to even lower yields when users take these rewards out of the jigsaw system.
+
+
+## What went wrong and how to fix it next time.
+
+* Didn't review the codebase like this.
+* Dint't think about this attack vector.
+  
+
+## Take aways.
+
+* When claiming rewards from the system and then withdrawing those same `fees` out of the system for external use, make sure there is `double fee` applied only from one part of the functionality like just for claiming rewards and not on the withdrawal functionality.
