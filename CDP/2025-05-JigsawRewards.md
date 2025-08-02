@@ -601,7 +601,7 @@ Hence, there is no way to disable borrowing on a specific collateral if it gets 
 
 ### [M-3]("https://cantina.xyz/code/7a40c849-0b35-4128-b084-d9a83fd533ea/findings/1374") Withdrawals of rewards earned through strategies should not be charged with withdrawal fees.
 
-f we check the StrategyManager.sol logic, we can see that any claimRewards() call by holding user will lead to strategy.claimRewards(). For example, Aave deposits give extra reward tokens, so the strategy helps us withdraw these from the Aave rewardController.
+If we check the StrategyManager.sol logic, we can see that any claimRewards() call by holding user will lead to strategy.claimRewards(). For example, Aave deposits give extra reward tokens, so the strategy helps us withdraw these from the Aave rewardController.
 
 Here is the code from AaveV3StrategyV2.sol :
 
@@ -667,3 +667,329 @@ This will lead to even lower yields when users take these rewards out of the jig
 ## Take aways.
 
 * When claiming rewards from the system and then withdrawing those same `fees` out of the system for external use, make sure there is `double fee` applied only from one part of the functionality like just for claiming rewards and not on the withdrawal functionality.
+
+
+### [M-4]("https://cantina.xyz/code/7a40c849-0b35-4128-b084-d9a83fd533ea/findings/1322") getAllowedAmountOutMin() returns wrong decimal scale breaking swap validation.
+
+`getAllowedAmountOutMin()` returns the minimum accepted asset amount. But the problem is, `getAllowedAmountOutMin()` doesn't consider the decimals difference between `USDT(6 decimals)` and `deUSD(18 decimals)`
+
+```solidity
+
+function getAllowedAmountOutMin(uint256 _amount, SwapDirection _swapDirection) public view returns (uint256) {
+    (, uint256 rate) = oracle.peek(bytes(""));
+    uint256 expectedTokenOut = _swapDirection == SwapDirection.FromTokenIn
+        ? _amount.mulDiv(rate, 1e18, Math.Rounding.Ceil)  // USDT → deUSD
+        : _amount.mulDiv(1e18, rate, Math.Rounding.Ceil); // deUSD → USDT
+    return _applySlippage(expectedTokenOut);
+}
+```
+
+Returned amount is further used in _swapExactInputMultihop() for checking invalid minimum amount during swap.
+
+```solidity
+
+        // Validate amountOutMin is within allowed slippage
+        if (amountOutMinimum < getAllowedAmountOutMin(_amountIn, _swapDirection)) revert InvalidAmountOutMin();
+```
+
+As result, `getAllowedAmountOutMin()` returns minAcceptedAmount in `6 decimals` instead of `18 decimals` for USDT -> deUSD swap and vice versa.
+
+## What went wrong and how to fix it next time.
+
+* Didn't review the codebase like this.
+* Dint't think about this attack vector.
+  
+## Take aways.
+
+* Always make sure before `swapping` that the tokens have the correct decimal scaling.
+* Always make sure an oracle returns the correct rate of a decimal in like in terms of proper decimal scaling.
+  
+### [M-5]("https://cantina.xyz/code/7a40c849-0b35-4128-b084-d9a83fd533ea/findings/1086") Incomplete Withdrawals Integration on Elixir Strategy.
+
+The current implementation of ElixirStrategy.sol does not account for all withdrawal scenarios, particularly when the cooldown period is disabled in the Elixir protocol.
+
+Elixir’s stdeUSD contract uses a cooldown mechanism for unstaking shares. To withdraw assets when the cooldown is active, the process involves two steps:
+
+1. Initiate cooldown via `cooldownShares()`
+
+```solidity
+
+/// @notice redeem shares into assets and starts a cooldown to claim the converted underlying asset
+    /// @param shares shares to redeem
+>>  function cooldownShares(uint256 shares) external ensureCooldownOn returns (uint256 assets) {
+        if (shares > maxRedeem(msg.sender)) revert ExcessiveRedeemAmount();
+
+        assets = previewRedeem(shares);
+
+>>      cooldowns[msg.sender].cooldownEnd = uint104(block.timestamp) + cooldownDuration;
+>>      cooldowns[msg.sender].underlyingAmount += uint152(assets);
+
+        _withdraw(msg.sender, address(silo), msg.sender, assets, shares);
+    }
+```
+
+* First, goes through a modifier ensuring the cooldown period is `active(ensureCooldownOn)`.
+* Second, this sets a cooldown period and maps the caller to the corresponding `underlyingAmount`.
+
+2. Complete withdrawal via `unstake` function:
+
+```solidity
+function unstake(address receiver) external {
+        UserCooldown storage userCooldown = cooldowns[msg.sender];
+        uint256 assets = userCooldown.underlyingAmount;
+
+        if (block.timestamp >= userCooldown.cooldownEnd || cooldownDuration == 0) {
+            userCooldown.cooldownEnd = 0;
+            userCooldown.underlyingAmount = 0;
+
+            silo.withdraw(receiver, assets);
+        } else {
+            revert InvalidCooldown();
+        }
+    }
+```
+
+* If the cooldown has expired, the user can withdraw the `underlyingAmount` set when cooling down the shares.
+
+However, the `stdeUSD contract` allows the admin to disable the cooldown by setting the cooldown duration to `0` using `setCooldownDuration()`:
+
+```solidity
+
+>>  /// @notice Set cooldown duration. If cooldown duration is set to zero, the StakeddeUSDV2 behavior changes to follow ERC4626 standard and disables cooldownShares and cooldownAssets methods. If cooldown duration is greater than zero, the ERC4626 withdrawal and redeem functions are disabled, breaking the ERC4626 standard, and enabling the cooldownShares and the cooldownAssets functions.
+    /// @param duration Duration of the cooldown
+    function setCooldownDuration(uint24 duration) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (duration > MAX_COOLDOWN_DURATION) {
+            revert InvalidCooldown();
+        }
+
+        uint24 previousDuration = cooldownDuration;
+        cooldownDuration = duration;
+        emit CooldownDurationUpdated(previousDuration, cooldownDuration);
+    }
+```
+
+As you can see, when cooldown is disabled:
+
+* `cooldownShares()` and `unstake()` stop working.
+* Withdrawals must be performed using the standard ERC4626 `withdraw()` or `redeem()` functions:
+
+```solidity
+
+/// @dev See {IERC4626-withdraw}.
+    function withdraw(uint256 assets, address receiver, address _owner)
+        public
+        virtual
+        override
+>>      ensureCooldownOff
+        returns (uint256)
+    {
+        return super.withdraw(assets, receiver, _owner);
+    }
+
+    /// @dev See {IERC4626-redeem}.
+    function redeem(uint256 shares, address receiver, address _owner)
+        public
+        virtual
+        override
+>>      ensureCooldownOff
+        returns (uint256)
+    {
+        return super.redeem(shares, receiver, _owner);
+    }
+
+```
+
+Despite this, the current strategy implementation only integrates with `unstake()`
+
+```solidity
+_genericCall({
+            _holding: _recipient,
+            _contract: tokenOut,
+>>          _call: abi.encodeCall(ISdeUsdMin.unstake, (address(this)))
+        });
+
+```
+
+This means that if the cooldown is disabled, `unstake()` will succeed in execution but return zero assets, as the cooldowns mapping was never populated — resulting in silent failures and loss of withdrawal capability.
+
+## What went wrong and how to fix it next time.
+
+* Didn't review the codebase like this.
+* Dint't think about this attack vector.
+  
+## Take aways.
+
+* Always make sure to see what can revert if admin disables an admin function and if that revert may brick users to receiving some services.
+* Always make sure to see what can revert if an admin sets the cooldown duration to zero like for instance withdrawals.
+
+### [M-6]("https://cantina.xyz/code/7a40c849-0b35-4128-b084-d9a83fd533ea/findings/468") Liquidity Imbalance Exploit in Jigsaw-Pendle Integration Leading to Unliquidatable Debt.
+
+The Jigsaw protocol’s use of Pendle’s liquidity operations via `addLiquiditySingleToken` and `removeLiquiditySingleToken` can lead to significant liquidity imbalances in Pendle pools, making certain collateral positions impossible to liquidate due to a built-in Pendle market safety mechanism (MarketProportionTooHigh). This imbalance enables an attacker to create an unliquidatable position, minting unlimited bad debt and causing substantial loss for the protocol.
+
+There is an issue in the way Jigsaw uses Pendle investments.
+
+Users can provide liquidity to Pendle pools using the IPActionAddRemoveLiqV3.addLiquiditySingleToken function. This process involves converting a single token into SY, which is then paired with PT to mint LP tokens.
+
+To withdraw liquidity, users utilize the IPActionAddRemoveLiqV3.removeLiquiditySingleToken function. This function burns LP tokens and converts the underlying SY and PT back into a single token, returning it to the user.
+
+The Pendle terminology explanation:
+
+In Pendle Finance V2 terminology, the underlying asset refers to the base yield-bearing token from which all Pendle tokens and positions are derived.
+
+SY (Standardized Yield) Pendle introduces a unified abstraction called SY, which wraps the underlying yield-bearing token (like stETH, aUSDC, wstETH, GLP, etc.) into a standard interface. It allows the protocol to interact with many different types of yield sources (e.g., Aave, Lido, GLP) using a consistent API.
+
+PT (Principal Token) and YT (Yield Token) When users deposit the SY token into Pendle, it gets split into:
+
+PT: Represents the principal (value locked until expiry).
+YT: Represents the right to yield from the underlying asset until expiry.
+Both PT and YT are derived from the underlying asset, indirectly via SY.
+
+Example: If a user brings in wstETH:
+
+wstETH = underlying asset
+→ Wrapped into SY-wstETH (standardized)
+→ Deposited into Pendle → split into PT-wstETH + YT-wstETH
+Now, note on Pendle Markets (pools). At first glance it might seem natural for a Pendle pool (called Market or IPMarket) to contain PT and YT, since these are the two tokens resulting from splitting an SY token. But in Pendle V2, the market contains PT and SY, and not YT. This is by design — because SY implicitly represents the YT component in the pool logic. YT is non-transferable to the pool and is meant to be held or traded separately.
+
+Now it can be seen why addLiquiditySingleToken and removeLiquiditySingleToken (which operate using only one token by design) create pool imbalances:
+
+addLiquiditySingleToken in a nutshell: buy PT in the pool, deposit just bought PT back along with extra SY.
+removeLiquiditySingleToken in a nutshell: withdraw PT and SY proportionally to the LP share, send PT back to the pool draining extra SY.
+The imbalance at the withdrawal step may be used by an attacker to block _claimInvestment and liquidations, minting bad debt.
+
+An attacker may exploit this issue this way:
+
+Create a holding
+Add some PT to the pool directly.
+StrategyManager.invest collateral to the same pool. Ths operation buy backs just added PT, so no imbalance is created and the attacker suffers no slippage.
+Repeat steps 2, 3 several times (even 2 times may be fine) until a significant share of the pool is acquired.
+At this point the attacker controls a significant share of the balanced pool. Since the pool is balanced: a) The attacker has no arbitrage risk (i.e. they didn't create a skewed position vulnerable to arbitrageurs). b) Unwinding such a position without purchasing back PT is impossible due to a MarketProportionTooHigh revert.
+Borrow as much as possible.
+The CDP becomes unliquidatable b/c of the reason explained at step 5.
+At this moment the attacker has a bullet-proof position: on the collateral appreciation, they pocket trading profits. On collateral depreciation, the position cannot be liquidated. Below the bad debt level, the attacker may buy back the collateral amount in a market and pocket excess debt (the excess debt in the attacker's hands is positive since the collateral value is now less than the debt minted). The net result for the attacker is the excess debt amount. The net result for the protocol is a loss in the form of bad debt (in essence distributed among jUSD holders).
+A few words on MarketProportionTooHigh revert. The Pendle market math is quite complicated compared to constant-product AMMs (including Uniswap v3). Trades creating imbalance don't just hit slippage, they hit market brakes. Pendle markets are adapted to trading bond-like products, so they have expiration dates. E.g., they have a notion of rate anchor (keeps price continuous across trades) and rate scalar (controls price sensitivity as expiry approaches). Pendle computes a rateScalar from the remaining time until expiry, so as maturity nears the curve automatically steepens (trades move the implied rate more for the same notional). Constant-product AMMs have zero notion of time, so they can’t model the decaying yield of a fixed-term instrument. A rateAnchor is carried forward from the last trade’s implied rate, preventing any jumps in price when liquidity gets added or after large trades. By contrast, constant-product pools can suffer discontinuities. Pricing is based on the log-odds function of the PT:asset ratio, which gives a more linear slippage profile around balanced pools - especially helpful for medium-sized trades—whereas constant-product curves have hyperbolic slippage that can spike quickly (they're never exhausted). That's the case we have here: instead of hyperbolic slippage we hit market brakes and revert entire transaction.
+
+Note that such a position cannot be liquidated even via the LiquidationManager.liquidateBadDebt call unless the collateral is forgiven to the attacker.
+
+The attack does not require all shares to withdraw (as currently implemented in _claimInvestment) to succeed. Most of the position is non-withdrawable. The actual withdrawable proportion depends on the pool ownership percentage.
+
+## What went wrong and how to fix it next time.
+
+* Didn't review the codebase like this.
+* Dint't think about this attack vector.
+  
+## Take aways.
+
+* N/A
+
+### [M-7]("https://cantina.xyz/code/7a40c849-0b35-4128-b084-d9a83fd533ea/findings/389") Liquidation DoS via 1 Wei Repayment Frontrun.
+
+An insolvent user can frontrun a liquidation transaction by repaying a minimal amount (1 wei) of their debt, causing the liquidation transaction to revert due to the `debt amount check` in the liquidation function.
+
+```solidity
+require(_jUsdAmount <= ISharesRegistry(registryAddress).borrowed(holding), "2003");
+```
+
+The attack works as follows:
+    1. User has an insolvent position with multiple collateral types
+    2. Liquidator attempts to liquidate the full debt for a specific collateral
+    3. User monitors mempool for liquidation transactions
+    4. User frontruns the liquidation by repaying 1 wei of jUSD
+    5. quidation transaction reverts because the liquidator's _jUsdAmount is now greater than the user's borrowed amount for that collateral.
+
+This creates a significant economic imbalance in the protocol. The liquidation mechanism becomes ineffective as users can prevent liquidation of their positions by paying minimal costs. This could lead to accumulation of `bad debt` in the protocol and increased insolvency risk.
+
+## What went wrong and how to fix it next time.
+
+* Didn't review the codebase like this.
+* actually had an idea about it but I repaid using the full amount instead of small amounts.
+
+
+## Take aways.
+
+* Make sure it is impossible to brick liquidations with small amounts i.e `1 wei` using `repay` function.
+* Pay attention to the check that shows how much a user has borrowed in the `liquidate` and `repay` function and see whether it can be exploited also.
+* Make sure there is some minum repayment amount in the `repay` function.
+  
+
+### [M-8]("https://cantina.xyz/code/7a40c849-0b35-4128-b084-d9a83fd533ea/findings/193") Users can avoid withdrawal fees by exiting through liquidation.
+
+Withdrawals are subject to protocol withdrawal fees, via `HoldingManager::withdraw()`:
+
+```solidity
+    function withdraw(
+        ...
+                (uint256 userAmount, uint256 feeAmount) = _withdraw({ _token: _token, _amount: _amount });
+
+        // Transfer the fee amount to the fee address.
+        if (feeAmount > 0) {
+            holding.transfer({ _token: _token, _to: manager.feeAddress(), _amount: feeAmount });
+
+```
+
+However, liquidation via `LiquidationManager::liquidate()` charges no protocol fees at all - the only fees charged are the liquidation bonus, which are waived if the user self liquidates:
+
+```solidity
+    function liquidate(
+        ...
+        collateralUsed += _user == msg.sender
+            ? 0
+            : collateralUsed.mulDiv(
+                ISharesRegistry(registryAddress).getConfig().liquidatorBonus, LIQUIDATION_PRECISION, Math.Rounding.Ceil
+            );
+
+```
+
+So users can avoid protocol fees by `withdrawing` through liquidations.
+
+## What went wrong and how to fix it next time.
+
+* Didn't think fo this attack vector to be quite honest.
+
+
+## Take aways.
+
+* Look for ways to invade fees by manipulation of outflows (other functions that drive amounts out the protocol).
+* Look to see in CDP's, how a user can invade fees on collateral from withdrawals by manipulating outflows like for instance `liquidations` or any other `outflow` function.
+
+### [M-9]("https://cantina.xyz/code/7a40c849-0b35-4128-b084-d9a83fd533ea/findings/7") Users can reduce self liquidation fees by manipulating the swap.
+
+`LiquidationManager::selfLiquidate()` charges a significant self liquidation fee, initialized as 8%. This is charged from the collateral used to self liquidate.
+
+However, a loophole allows users to greatly reduce the self liquidation fees: they can self sandwich their self liquidations swap manipulating the collateral price.
+
+```solidity
+    function selfLiquidate(
+        …
+        // Swap collateral for jUSD.
+@1>     uint256 collateralUsedForSwap = tempData.swapManager.swapExactOutputMultihop({
+            _tokenIn: _collateral,
+            _swapPath: tempData.swapPath,
+            _userHolding: tempData.holding,
+            _deadline: tempData.deadline,
+            _amountOut: tempData.jUsdAmountToBurn,
+            _amountInMaximum: tempData.amountInMaximum
+        });
+
+        // Compute the final fee amount (if any) to be paid for performing self-liquidation.
+@2>     uint256 finalFeeCollateral = collateralUsedForSwap.mulDiv(selfLiquidationFee, precision, Math.Rounding.Ceil);
+
+```
+
+```solidity
+    /**
+     * @notice The self-liquidation fee.
+     * @dev Uses 3 decimal precision, where 1% is represented as 1000.
+     * @dev 8% is the default self-liquidation fee.
+     */
+@3> uint256 public override selfLiquidationFee = 8e3;
+
+```
+
+## What went wrong and how to fix it next time.
+
+* Didn't think fo this attack vector to be quite honest.
+
+## Take aways.
+
+N/A
